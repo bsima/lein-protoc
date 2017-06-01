@@ -13,11 +13,19 @@
            [org.sonatype.aether.resolution VersionRangeRequest]
            [org.sonatype.aether RepositorySystem]))
 
-(def +proto-source-paths+
+(def +protoc-version-default+
+  :latest)
+
+(def +proto-source-paths-default+
   ["src/proto"])
 
-(def +protoc-timeout+
+(def +protoc-timeout-default+
   60)
+
+(defn target-path-default
+  [project]
+  (str (:target-path project)
+       "/generated-sources/protobuf"))
 
 (defn print-exception-msg
   [e]
@@ -39,6 +47,10 @@
          (> (count split) 1)
          (= ext "proto"))))
 
+(defn str->src-path-arg
+  [p]
+  (str "-I=" (.getAbsolutePath (io/file p))))
+
 (defn proto-files
   [source-directory]
   (->> source-directory
@@ -47,23 +59,26 @@
        (filter proto?)
        (map #(.getAbsolutePath %))))
 
-(defn str->src-path-arg
-  [p]
-  (str "-I=" (.getAbsolutePath (io/file p))))
-
 (defn build-cmd
-  [protoc-cmd src-paths target-path]
+  [protoc-path src-paths target-path]
   (let [src-paths-args  (map str->src-path-arg src-paths)
         target-path-arg (str "--java_out=" target-path)
         proto-files     (into [] (mapcat proto-files src-paths))]
     (leiningen.core.main/info
       (format "Compiling %s proto files: %s" (count proto-files) proto-files))
-    (->> (vector protoc-cmd src-paths-args target-path-arg proto-files)
+    (->> (vector protoc-path src-paths-args target-path-arg proto-files)
          flatten
          vec
          into-array)))
 
-(defn compile-proto
+(defn resolve-target-path!
+  [target-path]
+  (let [target-dir (io/file target-path)]
+    (if (.exists target-dir)
+      target-dir
+      (doto target-dir .mkdirs))))
+
+(defn compile-proto!
   "Given the fully qualified path to the protoc executable, a vector of
   relative or qualified source paths for the proto files, a relative or
   qualified target path for the generated sources, and a timeout value for
@@ -71,8 +86,9 @@
   the generated Java sources."
   [protoc-path src-paths target-path timeout]
   (try
-    (let [cmd     (build-cmd protoc-path src-paths target-path)
-          process (.exec (Runtime/getRuntime) cmd)]
+    (let [target-path (-> target-path resolve-target-path! .getAbsolutePath)
+          cmd         (build-cmd protoc-path src-paths target-path)
+          process     (.exec (Runtime/getRuntime) cmd)]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)
           (leiningen.core.main/info "Successfully compiled proto files")
@@ -127,7 +143,7 @@
   (let [arch (leiningen.core.utils/get-arch)]
     (name (if (= arch :x86) :x86_32 arch))))
 
-(defn resolve-protoc
+(defn resolve-protoc!
   "Given a string com.google.protobuf/protoc version or `:latest`, will ensure
   the required protoc executable is available in the local Maven repository
   either from a previous download, or will download from Maven Central."
@@ -199,7 +215,7 @@
                            to be compiled. Defaults to `[\"src/proto\"]`
     :proto-target-path  :: the absolute path or path relative to the project
                            root where the sources should be generated. Defaults
-                           to the `:target-path`
+                           to `${target-path}/generated-sources/protobuf`
     :protoc-timeout     :: timeout value in seconds for the compilation process
                            Defaults to 60
   "
@@ -212,11 +228,11 @@
     (if (not-empty errors)
       (print-exception-msg (format "Invalid configurations received: %s"
                                    (string/join "," errors)))
-      (compile-proto
-        (resolve-protoc (or protoc-version :latest))
-        (or proto-source-paths +proto-source-paths+)
-        (or proto-target-path (:target-path project))
-        (or protoc-timeout +protoc-timeout+)))))
+      (compile-proto!
+        (resolve-protoc! (or protoc-version +protoc-version-default+))
+        (or proto-source-paths +proto-source-paths-default+)
+        (or proto-target-path (target-path-default project))
+        (or protoc-timeout +protoc-timeout-default+)))))
 
 (defn javac-hook
   [f & args]
