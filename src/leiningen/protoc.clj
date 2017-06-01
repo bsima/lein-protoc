@@ -7,11 +7,12 @@
             [leiningen.javac]
             [robert.hooke :as hooke]
             [clojure.string :as string])
-  (:import [java.io File]
+  (:import [java.io File InputStreamReader BufferedReader]
            [java.util.concurrent TimeUnit]
            [org.sonatype.aether.util.artifact DefaultArtifact]
            [org.sonatype.aether.resolution VersionRangeRequest]
-           [org.sonatype.aether RepositorySystem]))
+           [org.sonatype.aether RepositorySystem]
+           (java.util.stream Collectors)))
 
 (def +protoc-version-default+
   :latest)
@@ -78,6 +79,12 @@
       target-dir
       (doto target-dir .mkdirs))))
 
+(defn parse-response
+  [process]
+  (if (> (.exitValue process) 0)
+    (print-exception-msg (str \newline (slurp (.getErrorStream process))))
+    (leiningen.core.main/info "Successfully compiled proto files")))
+
 (defn compile-proto!
   "Given the fully qualified path to the protoc executable, a vector of
   relative or qualified source paths for the proto files, a relative or
@@ -91,7 +98,7 @@
           process     (.exec (Runtime/getRuntime) cmd)]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)
-          (leiningen.core.main/info "Successfully compiled proto files")
+          (parse-response process)
           (print-exception-msg
             (format "Proto file compilation timed out after %s seconds"
                     timeout)))
