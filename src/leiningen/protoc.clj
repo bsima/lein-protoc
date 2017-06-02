@@ -1,4 +1,5 @@
 (ns leiningen.protoc
+  "Leiningen plugin for compiling Google Protocol Buffers"
   (:require [cemerick.pomegranate.aether :as aether]
             [clojure.java.io :as io]
             [clojure.spec :as spec]
@@ -7,12 +8,22 @@
             [leiningen.javac]
             [robert.hooke :as hooke]
             [clojure.string :as string])
-  (:import [java.io File InputStreamReader BufferedReader]
+  (:import [java.io File]
+           [java.net URI]
+           [java.nio.file
+            CopyOption
+            Files
+            FileSystems
+            FileVisitResult
+            LinkOption
+            Path
+            Paths
+            SimpleFileVisitor]
+           [java.nio.file.attribute FileAttribute]
            [java.util.concurrent TimeUnit]
            [org.sonatype.aether.util.artifact DefaultArtifact]
            [org.sonatype.aether.resolution VersionRangeRequest]
-           [org.sonatype.aether RepositorySystem]
-           (java.util.stream Collectors)))
+           [org.sonatype.aether RepositorySystem]))
 
 (def +protoc-version-default+
   :latest)
@@ -28,7 +39,7 @@
   (str (:target-path project)
        "/generated-sources/protobuf"))
 
-(defn print-exception-msg
+(defn print-warn-msg
   [e]
   (leiningen.core.main/warn
     (format "Failed to compile proto file(s): %s"
@@ -61,8 +72,8 @@
        (map #(.getAbsolutePath %))))
 
 (defn build-cmd
-  [protoc-path src-paths target-path]
-  (let [src-paths-args  (map str->src-path-arg src-paths)
+  [protoc-path src-paths target-path builtin-proto-path]
+  (let [src-paths-args  (map str->src-path-arg (conj src-paths builtin-proto-path))
         target-path-arg (str "--java_out=" target-path)
         proto-files     (into [] (mapcat proto-files src-paths))]
     (leiningen.core.main/info
@@ -82,7 +93,7 @@
 (defn parse-response
   [process]
   (if (> (.exitValue process) 0)
-    (print-exception-msg (str \newline (slurp (.getErrorStream process))))
+    (print-warn-msg (str \newline (slurp (.getErrorStream process))))
     (leiningen.core.main/info "Successfully compiled proto files")))
 
 (defn compile-proto!
@@ -91,26 +102,29 @@
   qualified target path for the generated sources, and a timeout value for
   the compilation, will run the Google Protocol Buffers Compiler and output
   the generated Java sources."
-  [protoc-path src-paths target-path timeout]
+  [protoc-path src-paths target-path timeout builtin-proto-path]
   (try
     (let [target-path (-> target-path resolve-target-path! .getAbsolutePath)
-          cmd         (build-cmd protoc-path src-paths target-path)
+          cmd         (build-cmd protoc-path
+                                 src-paths
+                                 target-path
+                                 builtin-proto-path)
           process     (.exec (Runtime/getRuntime) cmd)]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)
           (parse-response process)
-          (print-exception-msg
+          (print-warn-msg
             (format "Proto file compilation timed out after %s seconds"
                     timeout)))
         (catch Exception e
-          (print-exception-msg e))
+          (print-warn-msg e))
         (finally
           (.destroy process))))
     (catch Exception e
-      (print-exception-msg e))))
+      (print-warn-msg e))))
 
 ;;
-;; Resolve Protoc
+;; Resolve Proto
 ;;
 
 (defn latest-protoc-version
@@ -169,7 +183,71 @@
         (.setExecutable pfile true)
         (.getAbsolutePath pfile))
       (catch Exception e
-        (print-exception-msg e)))))
+        (print-warn-msg e)))))
+
+(defn vargs
+  [t]
+  (into-array t nil))
+
+(defn resolve-mismatched
+  [target-path source-path new-path]
+  (.resolve
+    target-path
+    (-> source-path
+        (.relativize new-path)
+        .toString
+        (Paths/get (vargs String)))))
+
+(defn jar-uri
+  [jar-string]
+  (URI. "jar:file" (-> (File. jar-string) .toURI .getPath) nil))
+
+(defn unpack-jar!
+  [proto-jar]
+  (with-open [proto-jar-fs (FileSystems/newFileSystem
+                             ^URI (jar-uri proto-jar)
+                             {})]
+    (let [src-path (.getPath proto-jar-fs "/" (vargs String))
+          tgt-path (Files/createTempDirectory
+                     "lein-protoc"
+                     (vargs FileAttribute))
+          tgt-file (.toFile tgt-path)]
+      (.deleteOnExit tgt-file)
+      (Files/walkFileTree
+        src-path
+        (proxy [SimpleFileVisitor] []
+          (preVisitDirectory [dir-path attrs]
+            (when (.startsWith dir-path "/google")
+              (let [target-dir (resolve-mismatched tgt-path src-path dir-path)]
+                (when (Files/notExists target-dir (vargs LinkOption))
+                  (Files/createDirectories target-dir (vargs FileAttribute))
+                  (-> target-dir .toFile .deleteOnExit))))
+            FileVisitResult/CONTINUE)
+          (visitFile [file attrs]
+            (when (.startsWith file "/google")
+              (let [tgt-file-path (resolve-mismatched tgt-path src-path file)]
+                (Files/copy file tgt-file-path (vargs CopyOption))
+                (-> tgt-file-path .toFile .deleteOnExit)))
+            FileVisitResult/CONTINUE)))
+      tgt-file)))
+
+(def proto-jar-regex
+  ".*com[\\/|\\\\]google[\\/|\\\\]protobuf[\\/|\\\\]protobuf-java[\\/|\\\\].*")
+
+(defn resolve-builtin-proto!
+  "If the project.clj includes the `com.google.protobuf/protobuf-java`
+  dependency, then we unpack it to a temporary location to use during
+  compilation in order to make the builtin proto files available."
+  [project]
+  (if-let [proto-jar (->> project
+                          leiningen.core.classpath/get-classpath
+                          (filter #(.matches % proto-jar-regex))
+                          first)]
+    (-> proto-jar unpack-jar! .getAbsolutePath)
+    (print-warn-msg 
+      (str "The `com.google.protobuf/protobuf-java` dependency is not on "
+           "the classpath so any Google standard proto files will not "
+           "be available to imports in source protos."))))
 
 ;;
 ;; Validate
@@ -230,16 +308,18 @@
   [{:keys [protoc-version
            proto-source-paths
            proto-target-path
-           protoc-timeout] :as project} & _]
+           protoc-timeout
+           proto-include-builtin?] :as project} & _]
   (let [errors (validate project)]
     (if (not-empty errors)
-      (print-exception-msg (format "Invalid configurations received: %s"
-                                   (string/join "," errors)))
+      (print-warn-msg (format "Invalid configurations received: %s"
+                              (string/join "," errors)))
       (compile-proto!
         (resolve-protoc! (or protoc-version +protoc-version-default+))
         (or proto-source-paths +proto-source-paths-default+)
         (or proto-target-path (target-path-default project))
-        (or protoc-timeout +protoc-timeout-default+)))))
+        (or protoc-timeout +protoc-timeout-default+)
+        (resolve-builtin-proto! project)))))
 
 (defn javac-hook
   [f & args]
