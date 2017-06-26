@@ -5,6 +5,7 @@
             [clojure.spec :as spec]
             [leiningen.core.main]
             [leiningen.core.utils]
+            [leiningen.core.classpath :as classpath]
             [leiningen.javac]
             [robert.hooke :as hooke]
             [clojure.string :as string])
@@ -20,10 +21,7 @@
             Paths
             SimpleFileVisitor]
            [java.nio.file.attribute FileAttribute]
-           [java.util.concurrent TimeUnit]
-           [org.sonatype.aether.util.artifact DefaultArtifact]
-           [org.sonatype.aether.resolution VersionRangeRequest]
-           [org.sonatype.aether RepositorySystem]))
+           [java.util.concurrent TimeUnit]))
 
 (def +protoc-version-default+
   :latest)
@@ -127,19 +125,12 @@
 ;; Resolve Proto
 ;;
 
-(defn latest-protoc-version
-  []
-  (let [system   (#'cemerick.pomegranate.aether/repository-system)
-        session  (aether/repository-session
-                   {:repository-system system
-                    :offline? false})
-        repo     (#'cemerick.pomegranate.aether/make-repository
-                   (first aether/maven-central)
-                   nil)
-        artifact (DefaultArtifact. "com.google.protobuf:protoc:(0,]")
-        request  (VersionRangeRequest. artifact, [repo], nil)
-        result   (.resolveVersionRange system session request)]
-    (.toString (.getHighestVersion result))))
+(defn latest-protoc-version []
+  (let [protoc-dep ['com.google.protobuf/protoc "(0,]" :extension "pom"]
+        repos {"central" {:url (aether/maven-central "central")}}]
+    (-> (classpath/dependency-hierarchy :deps {:deps [protoc-dep]
+                                               :repositories repos})
+        first first second)))
 
 (defn protoc-file
   [version classifier]
