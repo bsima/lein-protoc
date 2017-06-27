@@ -37,6 +37,16 @@
   (str (:target-path project)
        "/generated-sources/protobuf"))
 
+(defn qualify-path
+  [project path]
+  (let [p (Paths/get path (into-array String []))]
+    (if (.isAbsolute p)
+      path
+      (-> (Paths/get (str (:root project) File/separator path)
+                     (into-array String []))
+          .toAbsolutePath
+          .toString))))
+
 (defn print-warn-msg
   [e]
   (leiningen.core.main/warn
@@ -307,7 +317,8 @@
                               (string/join "," errors)))
       (compile-proto!
         (resolve-protoc! (or protoc-version +protoc-version-default+))
-        (or proto-source-paths +proto-source-paths-default+)
+        (mapv (partial qualify-path project)
+              (or proto-source-paths +proto-source-paths-default+))
         (or proto-target-path (target-path-default project))
         (or protoc-timeout +protoc-timeout-default+)
         (resolve-builtin-proto! project)))))
