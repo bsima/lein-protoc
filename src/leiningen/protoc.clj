@@ -87,10 +87,14 @@
 
 (defn build-cmd
   [protoc-path src-paths target-path builtin-proto-path]
-  (let [src-paths-args  (map str->src-path-arg (conj src-paths builtin-proto-path))
+  (let [all-srcs        (if builtin-proto-path
+                          (conj src-paths builtin-proto-path)
+                          src-paths)
+        src-paths-args  (map str->src-path-arg all-srcs)
         target-path-arg (str "--java_out=" target-path)
         proto-files     (mapcat proto-files src-paths)]
-    (when (outdated-protos? src-paths target-path)
+    (when (and (not-empty proto-files)
+               (outdated-protos? src-paths target-path))
       (main/info "Compiling" (count proto-files) "proto files:" proto-files)
       (concat [protoc-path target-path-arg] src-paths-args proto-files))))
 
@@ -243,7 +247,7 @@
                           (filter #(.matches % proto-jar-regex))
                           first)]
     (-> proto-jar unpack-jar! .getAbsolutePath)
-    (print-warn-msg
+    (main/info
       (str "The `com.google.protobuf/protobuf-java` dependency is not on "
            "the classpath so any Google standard proto files will not "
            "be available to imports in source protos."))))
