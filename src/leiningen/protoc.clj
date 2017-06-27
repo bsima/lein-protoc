@@ -3,7 +3,7 @@
   (:require [cemerick.pomegranate.aether :as aether]
             [clojure.java.io :as io]
             [clojure.spec :as spec]
-            [leiningen.core.main]
+            [leiningen.core.main :as main]
             [leiningen.core.utils]
             [leiningen.core.classpath :as classpath]
             [leiningen.javac]
@@ -49,11 +49,7 @@
 
 (defn print-warn-msg
   [e]
-  (leiningen.core.main/warn
-    (format "Failed to compile proto file(s): %s"
-            (if (instance? Exception e)
-              (.getMessage e)
-              e))))
+  (main/warn (format "Failed to compile proto file(s): %s" e)))
 
 ;;
 ;; Compile Proto
@@ -61,11 +57,13 @@
 
 (defn proto?
   [^File file]
-  (let [split (-> file .getName (string/split #"\."))
-        ext   (last split)]
-    (and (not (.isDirectory file))
-         (> (count split) 1)
-         (= ext "proto"))))
+  (and (not (.isDirectory file))
+       (re-find #".\.proto$" (.getName file))))
+
+(defn java?
+  [^File file]
+  (and (not (.isDirectory file))
+       (re-find #".\.java$" (.getName file))))
 
 (defn str->src-path-arg
   [p]
@@ -79,17 +77,22 @@
        (filter proto?)
        (map #(.getAbsolutePath %))))
 
+(defn- outdated-protos?
+  [src-paths target-path]
+  (let [proto-files (map io/file (mapcat proto-files src-paths))
+        out-files (filter java? (file-seq (io/file target-path)))]
+    (or (empty? out-files)
+        (>= (apply max (map (memfn lastModified) proto-files))
+            (apply max (map (memfn lastModified) out-files))))))
+
 (defn build-cmd
   [protoc-path src-paths target-path builtin-proto-path]
   (let [src-paths-args  (map str->src-path-arg (conj src-paths builtin-proto-path))
         target-path-arg (str "--java_out=" target-path)
-        proto-files     (into [] (mapcat proto-files src-paths))]
-    (leiningen.core.main/info
-      (format "Compiling %s proto files: %s" (count proto-files) proto-files))
-    (->> (vector protoc-path src-paths-args target-path-arg proto-files)
-         flatten
-         vec
-         into-array)))
+        proto-files     (mapcat proto-files src-paths)]
+    (when (outdated-protos? src-paths target-path)
+      (main/info "Compiling" (count proto-files) "proto files:" proto-files)
+      (concat [protoc-path target-path-arg] src-paths-args proto-files))))
 
 (defn resolve-target-path!
   [target-path]
@@ -100,9 +103,9 @@
 
 (defn parse-response
   [process]
-  (if (> (.exitValue process) 0)
+  (if (pos? (.exitValue process))
     (print-warn-msg (str \newline (slurp (.getErrorStream process))))
-    (leiningen.core.main/info "Successfully compiled proto files")))
+    (main/info "Successfully compiled proto files.")))
 
 (defn compile-proto!
   "Given the fully qualified path to the protoc executable, a vector of
@@ -111,25 +114,20 @@
   the compilation, will run the Google Protocol Buffers Compiler and output
   the generated Java sources."
   [protoc-path src-paths target-path timeout builtin-proto-path]
-  (try
-    (let [target-path (-> target-path resolve-target-path! .getAbsolutePath)
-          cmd         (build-cmd protoc-path
-                                 src-paths
-                                 target-path
-                                 builtin-proto-path)
-          process     (.exec (Runtime/getRuntime) cmd)]
+  (let [target-path (-> target-path resolve-target-path! .getAbsolutePath)
+        cmd         (build-cmd protoc-path
+                               src-paths
+                               target-path
+                               builtin-proto-path)]
+    (when-let [process (and cmd (.exec (Runtime/getRuntime) (into-array cmd)))]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)
           (parse-response process)
-          (print-warn-msg
-            (format "Proto file compilation timed out after %s seconds"
-                    timeout)))
+          (main/warn "Proto file compilation took more than" timeout "seconds."))
         (catch Exception e
           (print-warn-msg e))
         (finally
-          (.destroy process))))
-    (catch Exception e
-      (print-warn-msg e))))
+          (.destroy process))))))
 
 ;;
 ;; Resolve Proto
@@ -245,7 +243,7 @@
                           (filter #(.matches % proto-jar-regex))
                           first)]
     (-> proto-jar unpack-jar! .getAbsolutePath)
-    (print-warn-msg 
+    (print-warn-msg
       (str "The `com.google.protobuf/protobuf-java` dependency is not on "
            "the classpath so any Google standard proto files will not "
            "be available to imports in source protos."))))
