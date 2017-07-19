@@ -92,11 +92,12 @@
                           src-paths)
         src-paths-args  (map str->src-path-arg all-srcs)
         target-path-arg (str "--java_out=" target-path)
+        grpc-path-arg   (str "--grpc-java_out=" target-path)
         proto-files     (mapcat proto-files src-paths)]
     (when (and (not-empty proto-files)
                (outdated-protos? src-paths target-path))
       (main/info "Compiling" (count proto-files) "proto files:" proto-files)
-      (concat [protoc-path target-path-arg] src-paths-args proto-files))))
+      (concat [protoc-path target-path-arg grpc-path-arg] src-paths-args proto-files))))
 
 (defn resolve-target-path!
   [target-path]
