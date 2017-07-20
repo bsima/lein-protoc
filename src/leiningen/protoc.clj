@@ -104,7 +104,8 @@
         target-path-arg (str "--java_out="
                              (resolve-target-path! proto-target-path))
         grpc-plugin-arg (when protoc-grpc-exe
-                          (str "--plugin=" protoc-grpc-exe))
+                          (str "--plugin=protoc-gen-grpc-java="
+                               protoc-grpc-exe))
         grpc-path-arg   (when protoc-grpc-exe
                           (str "--grpc-java_out="
                                (resolve-target-path! grpc-target-path)))
@@ -127,7 +128,7 @@
 (defn compile-proto!
   "Compiles the sources using the provided configurations"
   [compiler-details source-paths target-paths timeout]
-  (let [cmd (build-cmd compiler-details source-paths target-paths)]
+  (when-let [cmd (build-cmd compiler-details source-paths target-paths)]
     (when-let [process (and cmd (.exec (Runtime/getRuntime) (into-array cmd)))]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)

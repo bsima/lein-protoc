@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+option java_package = "com.liaison.bar";
+option java_outer_classname = "BarProtos";
+
+message Request {
+    string bar = 1;
+}
+
+message Response {
+    int32 status = 1;
+}
+
+service BarService {
+    rpc GetBar(Request) returns (Response) {}
+}
