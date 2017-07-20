@@ -85,26 +85,38 @@
         (>= (apply max (map (memfn lastModified) proto-files))
             (apply max (map (memfn lastModified) out-files))))))
 
-(defn build-cmd
-  [protoc-path src-paths target-path builtin-proto-path]
-  (let [all-srcs        (if builtin-proto-path
-                          (conj src-paths builtin-proto-path)
-                          src-paths)
-        src-paths-args  (map str->src-path-arg all-srcs)
-        target-path-arg (str "--java_out=" target-path)
-        grpc-path-arg   (str "--grpc-java_out=" target-path)
-        proto-files     (mapcat proto-files src-paths)]
-    (when (and (not-empty proto-files)
-               (outdated-protos? src-paths target-path))
-      (main/info "Compiling" (count proto-files) "proto files:" proto-files)
-      (concat [protoc-path target-path-arg grpc-path-arg] src-paths-args proto-files))))
-
 (defn resolve-target-path!
   [target-path]
   (let [target-dir (io/file target-path)]
     (if (.exists target-dir)
       target-dir
-      (doto target-dir .mkdirs))))
+      (.mkdirs target-dir))
+    (.getAbsolutePath target-dir)))
+
+(defn build-cmd
+  [{:keys [protoc-exe protoc-grpc-exe]}
+   {:keys [proto-source-paths builtin-proto-path]}
+   {:keys [proto-target-path grpc-target-path]}]
+  (let [all-srcs        (if builtin-proto-path
+                          (conj proto-source-paths builtin-proto-path)
+                          proto-source-paths)
+        src-paths-args  (map str->src-path-arg all-srcs)
+        target-path-arg (str "--java_out="
+                             (resolve-target-path! proto-target-path))
+        grpc-plugin-arg (when protoc-grpc-exe
+                          (str "--plugin=" protoc-grpc-exe))
+        grpc-path-arg   (when protoc-grpc-exe
+                          (str "--grpc-java_out="
+                               (resolve-target-path! grpc-target-path)))
+        proto-files     (mapcat proto-files proto-source-paths)]
+    (when (and (not-empty proto-files)
+               (outdated-protos? proto-source-paths proto-target-path))
+      (main/info "Compiling" (count proto-files) "proto files:" proto-files)
+      (->> (concat [protoc-exe target-path-arg grpc-plugin-arg grpc-path-arg]
+                   src-paths-args
+                   proto-files)
+           (remove nil?)
+           vec))))
 
 (defn parse-response
   [process]
@@ -113,17 +125,9 @@
     (main/info "Successfully compiled proto files.")))
 
 (defn compile-proto!
-  "Given the fully qualified path to the protoc executable, a vector of
-  relative or qualified source paths for the proto files, a relative or
-  qualified target path for the generated sources, and a timeout value for
-  the compilation, will run the Google Protocol Buffers Compiler and output
-  the generated Java sources."
-  [protoc-path src-paths target-path timeout builtin-proto-path]
-  (let [target-path (-> target-path resolve-target-path! .getAbsolutePath)
-        cmd         (build-cmd protoc-path
-                               src-paths
-                               target-path
-                               builtin-proto-path)]
+  "Compiles the sources using the provided configurations"
+  [compiler-details source-paths target-paths timeout]
+  (let [cmd (build-cmd compiler-details source-paths target-paths)]
     (when-let [process (and cmd (.exec (Runtime/getRuntime) (into-array cmd)))]
       (try
         (if (.waitFor process timeout TimeUnit/SECONDS)
@@ -138,12 +142,15 @@
 ;; Resolve Proto
 ;;
 
-(defn latest-protoc-version []
-  (let [protoc-dep ['com.google.protobuf/protoc "(0,]" :extension "pom"]
+(defn latest-version
+  [artifact]
+  (let [protoc-dep [artifact "(0,]" :extension "pom"]
         repos {"central" {:url (aether/maven-central "central")}}]
-    (-> (classpath/dependency-hierarchy :deps {:deps [protoc-dep]
-                                               :repositories repos})
-        first first second)))
+    (-> (classpath/dependency-hierarchy
+          :deps {:deps [protoc-dep] :repositories repos})
+        first
+        first
+        second)))
 
 (defn protoc-file
   [version classifier]
@@ -158,6 +165,18 @@
     version
     (str "protoc-" version "-" classifier ".exe")))
 
+(defn protoc-grpc-file
+  [version classifier]
+  (io/file
+    (System/getProperty "user.home")
+    ".m2"
+    "repository"
+    "io"
+    "grpc"
+    "protoc-gen-grpc-java"
+    version
+    (str "protoc-gen-grpc-java-" version "-" classifier ".exe")))
+
 (defn get-os
   []
   (let [os (leiningen.core.utils/get-os)]
@@ -168,26 +187,46 @@
   (let [arch (leiningen.core.utils/get-arch)]
     (name (if (= arch :x86) :x86_32 arch))))
 
+(defn resolve!
+  "Resolves the Google Protocol Buffers code generation artifact+version in the
+  local maven repository if it exists or downloads from Maven Central"
+  [artifact protoc-version]
+  (let [classifier  (str (get-os) "-" (get-arch))
+        version     (if (= :latest protoc-version)
+                      (latest-version artifact)
+                      protoc-version)
+        coordinates [artifact version :classifier classifier :extension "exe"]]
+    (aether/resolve-artifacts :coordinates [coordinates])
+    coordinates))
+
 (defn resolve-protoc!
   "Given a string com.google.protobuf/protoc version or `:latest`, will ensure
   the required protoc executable is available in the local Maven repository
   either from a previous download, or will download from Maven Central."
   [protoc-version]
-  (let [classifier (str (get-os) "-" (get-arch))
-        version    (if (= :latest protoc-version)
-                     (latest-protoc-version)
-                     protoc-version)]
-    (try
-      (aether/resolve-artifacts
-        :coordinates [['com.google.protobuf/protoc
-                       version
-                       :classifier classifier
-                       :extension "exe"]])
+  (try
+    (let [[_ version _ classifier]
+          (resolve! 'com.google.protobuf/protoc protoc-version)]
       (let [pfile (protoc-file version classifier)]
         (.setExecutable pfile true)
-        (.getAbsolutePath pfile))
-      (catch Exception e
-        (print-warn-msg e)))))
+        (.getAbsolutePath pfile)))
+    (catch Exception e
+      (print-warn-msg e))))
+
+(defn resolve-protoc-grpc!
+  "Given a string io.grpc/protoc-gen-grpc-java version or `:latest`, will
+  ensure the required protoc executable is available in the local Maven
+  repository either from a previous download, or will download from Maven
+  Central."
+  [protoc-version]
+  (try
+    (let [[_ version _ classifier]
+          (resolve! 'io.grpc/protoc-gen-grpc-java protoc-version)]
+      (let [pfile (protoc-grpc-file version classifier)]
+        (.setExecutable pfile true)
+        (.getAbsolutePath pfile)))
+    (catch Exception e
+      (print-warn-msg e))))
 
 (defn vargs
   [t]
@@ -254,7 +293,7 @@
            "be available to imports in source protos."))))
 
 ;;
-;; Validate
+;; Options Validation and Parsing
 ;;
 
 (spec/def :protoc/version
@@ -267,6 +306,13 @@
 (spec/def :protoc/target-path
   (spec/nilable string?))
 
+(spec/def :protoc/grpc
+  (spec/nilable
+    (spec/or :bool #(instance? Boolean %)
+             :map  (spec/keys
+                     :opt-un [:protoc/version
+                              :protoc/target-path]))))
+
 (spec/def :protoc/timeout
   (spec/nilable integer?))
 
@@ -278,14 +324,39 @@
 (defn validate
   "Validates the input arguments and returns a vector of error messages"
   [{:keys [protoc-version
+           protoc-grpc
            proto-source-paths
            proto-target-path
            protoc-timeout]}]
   (let [v-err (explain :protoc/version protoc-version)
+        g-err (explain :protoc/grpc protoc-grpc)
         s-err (explain :protoc/source-paths proto-source-paths)
         t-err (explain :protoc/target-path proto-target-path)
         o-err (explain :protoc/timeout protoc-timeout)]
-    (remove nil? [v-err s-err t-err o-err])))
+    (remove nil? [v-err g-err s-err t-err o-err])))
+
+(defn compiler-details
+  [{:keys [protoc-version protoc-grpc] :as project}]
+  {:protoc-exe
+   (resolve-protoc! (or protoc-version +protoc-version-default+))
+   :protoc-grpc-exe
+   (when protoc-grpc
+     (resolve-protoc-grpc!
+       (or (:version protoc-grpc) +protoc-version-default+)))})
+
+(defn all-source-paths
+  [{:keys [proto-source-paths] :as project}]
+  {:proto-source-paths
+   (mapv (partial qualify-path project)
+         (or proto-source-paths +proto-source-paths-default+))
+   :builtin-proto-path
+   (resolve-builtin-proto! project)})
+
+(defn all-target-paths
+  [{:keys [proto-target-path protoc-grpc] :as project}]
+  (let [target-path (or proto-target-path (target-path-default project))]
+    {:proto-target-path target-path
+     :grpc-target-path  (or (:target-path protoc-grpc) target-path)}))
 
 ;;
 ;; Main
@@ -299,32 +370,40 @@
 
     :protoc-version     :: the Protocol Buffers Compiler version to use.
                            Defaults to `:latest`
+
     :proto-source-paths :: vector of absolute paths or paths relative to
                            the project root that contain the .proto files
                            to be compiled. Defaults to `[\"src/proto\"]`
+
     :proto-target-path  :: the absolute path or path relative to the project
                            root where the sources should be generated. Defaults
                            to `${target-path}/generated-sources/protobuf`
+
+    :protoc-grpc        :: true (or empty map) to generate interfaces for gRPC
+                           service definitions with default settings. Can
+                           optionally provide a map with the following configs:
+                             :version     - version number for gRPC codegen.
+                                            Defaults to :latest.
+                             :target-path - absolute path or path relative to
+                                            the project root where the sources
+                                            should be generated. Defaults to
+                                            the `:proto-target-path`
+                           Defaults to `false`.
+
     :protoc-timeout     :: timeout value in seconds for the compilation process
                            Defaults to 60
   "
   {:help-arglists '([])}
-  [{:keys [protoc-version
-           proto-source-paths
-           proto-target-path
-           protoc-timeout
-           proto-include-builtin?] :as project} & _]
+  [{:keys [protoc-timeout] :as project} & _]
   (let [errors (validate project)]
     (if (not-empty errors)
       (print-warn-msg (format "Invalid configurations received: %s"
                               (string/join "," errors)))
       (compile-proto!
-        (resolve-protoc! (or protoc-version +protoc-version-default+))
-        (mapv (partial qualify-path project)
-              (or proto-source-paths +proto-source-paths-default+))
-        (or proto-target-path (target-path-default project))
-        (or protoc-timeout +protoc-timeout-default+)
-        (resolve-builtin-proto! project)))))
+        (compiler-details project)
+        (all-source-paths project)
+        (all-target-paths project)
+        (or protoc-timeout +protoc-timeout-default+)))))
 
 (defn javac-hook
   [f & args]
